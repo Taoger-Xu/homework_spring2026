@@ -54,7 +54,9 @@ class Reinforce(RLAlgorithm):
             generator=rng,
             device=next(model.parameters()).device,
         ):
+            # adv 是每条回答一个的优势值，形状 [B_mb]；裁剪防止极端优势值产生过大梯度。
             adv = mb.advantages.clamp(-cfg.adv_clip, cfg.adv_clip).detach()
+            # [B_mb, L-1]，只标记有效的生成 token
             mask = mb.completion_mask
             if float(mask.sum().item()) <= 0.0:
                 skipped_empty += 1
@@ -87,8 +89,21 @@ class Reinforce(RLAlgorithm):
             # 4. kl = approx_kl_from_logprobs(new_logp, mb.ref_logprobs, mask)
             # 5. entropy = -masked_mean(new_logp, mask) for LOGGING ONLY
             #    (do not add an entropy term to the loss)
-            raise NotImplementedError("student TODO: Reinforce.update minibatch computations")
+            # new_logp 形状是 [B_mb, L-1]，这次计算保留梯度
+            new_logp = compute_per_token_logprobs(
+                model,
+                mb.input_ids,
+                mb.attention_mask,
+            )
+            # 每条回答的有效生成 token 求平均，得到 [B_mb]：每条回答一个平均 log 概率
+            seq_logp_i = masked_mean_per_row(new_logp, mask)
+            # 每条回答的平均 log 概率乘上自己的 advantage
+            pg_loss = -(adv * seq_logp_i).mean()
 
+            kl = approx_kl_from_logprobs(new_logp, mb.ref_logprobs, mask)
+            entropy = -masked_mean(new_logp, mask)
+
+            # 真正的损失
             loss = (pg_loss + cfg.kl_coef * kl) / max(1, grad_accum_steps)
             if not torch.isfinite(loss):
                 skipped_nonfinite += 1
@@ -99,6 +114,7 @@ class Reinforce(RLAlgorithm):
 
             accum += 1
 
+            # 达到累积次数后更新模型
             if (accum % max(1, grad_accum_steps)) == 0:
                 gnorm = clip_grad_norm_(trainable_params, cfg.max_grad_norm)
                 if not math.isfinite(gnorm):

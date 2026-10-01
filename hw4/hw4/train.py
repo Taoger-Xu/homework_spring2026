@@ -182,27 +182,25 @@ def build_algo(cfg: TrainConfig):
 
 
 def compute_group_advantages(rewards: torch.Tensor, group_size: int, eps: float = 1e-6) -> torch.Tensor:
-    # TODO(student): implement group-relative advantage normalization.
-    # rewards is a flat vector of length N = batch_size * group_size in prompt-major
-    # order, so the group_size sampled completions for the same prompt are contiguous.
-    #
-    # IMPORTANT SHAPE CONVENTION:
-    # reshape to [num_groups, group_size] (NOT [group_size, num_groups]) before
-    # normalizing within each prompt's group.
-    #
-    # For each group g and candidate i:
-    #   A_{g,i} = (r_{g,i} - mean(r_g)) / (std(r_g) + eps)
-    # Use the population standard deviation within each group (PyTorch:
-    # std(..., unbiased=False)), not the sample-standard-deviation correction.
-    #
-    # Edge cases to handle:
-    # - group_size <= 1
-    # - rewards.numel() not divisible by group_size
-    # - near-zero within-group std: do not emit NaNs/Infs; use a stable fallback
-    #   of your choice for that group
-    #
-    # Return a flat tensor with the same shape/order as rewards.
-    raise NotImplementedError("student TODO: compute_group_advantages")
+    """按同一 prompt 的回答分组，将奖励转换为组内相对优势值。"""
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if rewards.numel() % group_size != 0:
+        raise ValueError("rewards length must be divisible by group_size")
+
+    # 同一 prompt 的 group_size 条回答连续排列，每行对应一个 prompt。
+    grouped = rewards.reshape(-1, group_size)
+    if group_size == 1:
+        return torch.zeros_like(rewards)
+
+    # 在每组内部计算均值和总体标准差，保持维度以便广播到组内各回答。
+    group_mean = grouped.mean(dim=1, keepdim=True)
+    group_std = grouped.std(dim=1, unbiased=False, keepdim=True)
+    advantages = (grouped - group_mean) / (group_std + eps)
+
+    # 组内奖励没有可靠差异时，整组优势设为零，避免放大数值噪声。
+    advantages = torch.where(group_std > eps, advantages, torch.zeros_like(advantages))
+    return advantages.reshape_as(rewards)
 
 
 def maybe_normalize_advantages(advantages: torch.Tensor, enabled: bool, eps: float = 1e-6) -> torch.Tensor:
@@ -211,7 +209,16 @@ def maybe_normalize_advantages(advantages: torch.Tensor, enabled: bool, eps: flo
     # Again use the population standard deviation (unbiased=False).
     # Otherwise return A unchanged.
     # Keep the output shape identical to the input shape.
-    raise NotImplementedError("student TODO: maybe_normalize_advantages")
+    if not enabled:
+        return advantages
+
+    mean = advantages.mean()
+    std = advantages.std(unbiased=False)
+
+    if std <= eps:
+        return torch.zeros_like(advantages)
+
+    return (advantages - mean) / (std + eps)
 
 
 def maybe_update_warmup_lr(optimizer: torch.optim.Optimizer, base_lr: float, step: int, warmup_steps: int) -> None:
@@ -501,6 +508,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
+    # 创建可训练模型与优化器
     loaded = load_lora_policy_model_and_tokenizer(
         cfg.model_name,
         device=device,
@@ -525,7 +533,10 @@ def main():
         weight_decay=cfg.weight_decay,
     )
 
+    # 创建任务、采样器和 RL 算法
+    # 提供训练题目、奖励函数和评估指标；是 format_copy 或 math_hard
     task = build_task(cfg)
+    # 用当前模型对题目生成回答，并缓存 token、mask、old/ref log-prob
     sampler = HFSampler(tokenizer=tokenizer, device=device)
     sampling_cfg = SamplingConfig(
         min_new_tokens=cfg.min_new_tokens,
@@ -536,6 +547,8 @@ def main():
         repetition_penalty=cfg.repetition_penalty,
         do_sample=(cfg.temperature > 0.0),
     )
+
+    # 选择 REINFORCE 或 GRPO，负责计算 loss 和更新模型参数
     algo = build_algo(cfg)
 
     logger = WandBLogger(
@@ -551,6 +564,8 @@ def main():
         local_dir=out_dir,
     )
 
+    # 正式进入训练循环前，代码会先运行一次 baseline evaluation。
+    # 这样后面可以比较“RL 更新前”和“更新后”的表现。
     eval_gen_fn, eval_gen_batch_fn = make_generate_fns(model, tokenizer, device)
 
     def run_eval_for_task(*, eval_step: int, phase: str) -> Dict[str, float]:
@@ -651,6 +666,8 @@ def main():
         logger.log(getattr(task, "dataset_stats"), step=0)
 
     pbar = trange(cfg.steps, desc=f"train[{cfg.algo}|{cfg.task}]")
+
+    # 训练循环主体
     for step in pbar:
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -662,6 +679,8 @@ def main():
         task_names = [ex.task_name for ex in examples]
         task_metas = [ex.meta for ex in examples]
 
+        # 抽题并生成 rollout
+        # rollout_out 此时包含生成内容和概率信息，但还没有 reward 或 advantage
         rollout_out = sampler.rollout(
             policy_model=model,
             prompt_messages=prompt_messages,
@@ -673,6 +692,7 @@ def main():
             output_to_cpu=cfg.rollout_on_cpu,
         )
 
+        # 给回答评分，计算 advantage
         rewards: List[float] = []
         reward_infos: List[Dict[str, Any]] = []
         info_accum: Dict[str, float] = {}
@@ -690,6 +710,8 @@ def main():
         adv_t = compute_group_advantages(rewards_t, cfg.group_size)
         adv_t = maybe_normalize_advantages(adv_t, cfg.normalize_advantages)
 
+        # 然后将采样结果、reward 和 advantage 合并成 RolloutBatch。
+        # 这是从“已生成的回答”变成“可交给 RL 算法更新的数据”的位置
         rollout_batch = RolloutBatch(
             input_ids=rollout_out.input_ids,
             attention_mask=rollout_out.attention_mask,
@@ -705,6 +727,7 @@ def main():
             # No-op when sampler already returned CPU tensors. Kept for safety.
             rollout_batch = rollout_batch.to(torch.device("cpu"))
 
+        # 调用算法更新模型
         stats = algo.update(
             model=model,
             optimizer=optimizer,
